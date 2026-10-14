@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f2933">
+<link rel="manifest" href="manifest.json">
+<title>Mandarin Tutor</title>
+<style>
+  :root { --bg:#14181d; --panel:#1f2933; --text:#e8edf2; --muted:#9aa7b4; --accent:#e4572e; --user:#2d4a63; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f4ef; --panel:#ffffff; --text:#1c2227; --muted:#5d6b78; --accent:#c8431c; --user:#dbe8f3; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, sans-serif;
+         display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 8px; padding: 10px 16px; background: var(--panel); }
+  header h1 { font-size: 17px; margin: 0; flex: 1; }
+  button { font: inherit; border: 0; border-radius: 10px; padding: 8px 12px; background: var(--accent);
+           color: #fff; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--muted); }
+  #mic { min-width: 92px; }
+  #mic.on { background: #2e7d32; }
+  #chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 92%; padding: 10px 14px; border-radius: 16px; background: var(--panel); }
+  .msg.user { align-self: flex-end; background: var(--user); }
+  .msg.tutor { align-self: flex-start; }
+  .en { margin: 4px 0; }
+  .zh { margin: 8px 0; padding-left: 10px; border-left: 3px solid var(--accent); }
+  .hanzi { font-size: 24px; letter-spacing: 1px; }
+  .pinyin { color: var(--accent); }
+  .gloss { color: var(--muted); font-size: 14px; }
+  .replay { margin-top: 6px; padding: 4px 10px; font-size: 13px; background: transparent;
+            color: var(--muted); border: 1px solid var(--muted); }
+  #status { min-height: 20px; padding: 0 16px; color: var(--muted); font-size: 13px; }
+  #meter { height: 4px; margin: 4px 16px; background: var(--panel); border-radius: 2px; overflow: hidden; }
+  #meterFill { height: 100%; width: 0; background: #2e7d32; transition: width 0.08s; }
+  form { display: flex; gap: 8px; padding: 10px 16px calc(10px + env(safe-area-inset-bottom)); background: var(--panel); }
+  input[type=text] { flex: 1; min-width: 0; font: inherit; padding: 10px 12px; border-radius: 10px;
+                     border: 1px solid var(--muted); background: var(--bg); color: var(--text); }
+  details { padding: 0 16px 8px; background: var(--panel); }
+  summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
+  label { display: block; margin: 8px 0 2px; font-size: 13px; color: var(--muted); }
+  select, input.field { width: 100%; font: inherit; padding: 8px; border-radius: 8px;
+                        border: 1px solid var(--muted); background: var(--bg); color: var(--text); }
+  .note { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mandarin Tutor</h1>
+  <button type="button" id="stop" class="ghost">Stop voice</button>
+  <button type="button" id="clear" class="ghost">Clear</button>
+</header>
+
+<details>
+  <summary>Settings</summary>
+  <label for="apiKey">Gemini API key (stored only in this browser)</label>
+  <input class="field" id="apiKey" type="password" autocomplete="off" placeholder="Leave empty for typed demo mode">
+  <label for="model">Model</label>
+  <input class="field" id="model" type="text">
+  <label for="level">Mandarin share</label>
+  <select id="level">
+    <option value="low">Low: mostly English</option>
+    <option value="mid">Medium</option>
+    <option value="high">High: mostly Mandarin</option>
+  </select>
+  <label for="pause">Pause before it replies</label>
+  <select id="pause">
+    <option value="1200">Short (1.2 s)</option>
+    <option value="1800">Normal (1.8 s)</option>
+    <option value="2600">Long (2.6 s), for thinking time</option>
+  </select>
+  <label for="enVoice">English voice</label>
+  <select id="enVoice"><option value="">Auto</option></select>
+  <label for="zhVoice">Mandarin voice</label>
+  <select id="zhVoice"><option value="">Auto</option></select>
+  <p class="note">Voice choices come from the voices installed on your device. If the Mandarin list is empty, install a Chinese voice in Android's text-to-speech settings.</p>
+</details>
+
+<div id="chat" aria-live="polite"></div>
+<div id="status">Loading… if this stays, scripts are blocked here. Open this file in Chrome.</div>
+<div id="meter" hidden><div id="meterFill"></div></div>
+<noscript><div style="padding:0 16px;color:#e4572e">JavaScript is turned off, so the app cannot run.</div></noscript>
+
+<form id="form" onsubmit="return false">
+  <button type="button" id="mic">🎤 Talk</button>
+  <input type="text" id="input" placeholder="Or type here…" autocomplete="off">
+  <button type="button" id="send">Send</button>
+</form>
+
+<script>
+window.addEventListener('error', function (e) {
+  var s = document.getElementById('status');
+  if (s) s.textContent = 'Error: ' + e.message;
+});
+</script>
+<script>
+// Tutor brain: system prompt, Gemini call, mock tutor, and chunk parsing.
+// Works in the browser (window.Tutor) and in Node (module.exports) so the logic can be tested.
+(function (root) {
+  'use strict';
+
+  const SYSTEM_PROMPT = `You are a friendly Mandarin conversation tutor for an English-speaking beginner.
+The learner wants free-flowing spoken conversation, not structured lessons.
+
+STYLE
+- Speak mostly English with short Mandarin phrases mixed in. Current Mandarin share: {{LEVEL}}.
+- Keep each reply short (2-4 sentences) so it works spoken aloud. Ask a follow-up question to keep the chat going.
+- Use simplified characters and mainland standard Mandarin.
+- If the learner makes a mistake, repeat their sentence naturally corrected and briefly say why. Do NOT comment on their pronunciation or tones from the transcript, because speech-to-text cannot hear tones.
+- When you introduce a new Mandarin word, use it in a short phrase and give the English meaning.
+
+WHEN THE LEARNER'S MESSAGE IS AUDIO
+- First transcribe exactly what they said into "heard", keeping their mistakes and keeping both languages as spoken (Mandarin in simplified hanzi, English in English). Never tidy or correct the transcript.
+- Then reply to what they meant. If you could not make out the audio, set "heard" to "" and ask them kindly to say it again.
+- You only get a transcript, not their tones. Never claim to have judged their pronunciation.
+
+OUTPUT FORMAT (strict)
+Return ONLY JSON: {"heard":"(audio turns only: literal transcript)","chunks":[{"lang":"en","text":"..."},{"lang":"zh","text":"我想喝咖啡","pinyin":"wǒ xiǎng hē kāfēi","gloss":"I want to drink coffee"}]}
+- "lang" is "en" or "zh". Every chunk contains ONE language only; never mix scripts inside a chunk.
+- "zh" chunks must have "pinyin" (with tone marks) and "gloss" (English).
+- "en" chunks contain no Chinese characters.`;
+
+  const LEVELS = {
+    low: 'about 15% (mostly English, a few Mandarin words and phrases)',
+    mid: 'about 40% (English framing, short Mandarin sentences)',
+    high: 'about 70% (mostly simple Mandarin, English only to rescue)'
+  };
+
+  const HAN = /[㐀-鿿]/;
+
+  // Make sure every chunk is single-language. If a model slips and mixes scripts inside one
+  // chunk, split it at the script boundary so each piece can be spoken with the right voice.
+  function normaliseChunks(chunks) {
+    const out = [];
+    for (const c of chunks || []) {
+      if (!c || typeof c.text !== 'string' || !c.text.trim()) continue;
+      const text = c.text.trim();
+      const hasHan = HAN.test(text);
+      const hasLatin = /[A-Za-z]{2,}/.test(text);
+      if (c.lang === 'zh' && !hasLatin) {
+        out.push({ lang: 'zh', text, pinyin: c.pinyin || '', gloss: c.gloss || '' });
+      } else if (c.lang === 'en' && !hasHan) {
+        out.push({ lang: 'en', text });
+      } else {
+        // mixed or mislabelled: split by script runs
+        const parts = text.match(/[㐀-鿿　-〿＀-￯，。！？、]+|[^㐀-鿿　-〿＀-￯，。！？、]+/g) || [];
+        for (const p of parts) {
+          if (!p.trim()) continue;
+          if (HAN.test(p)) out.push({ lang: 'zh', text: p.trim(), pinyin: '', gloss: '' });
+          else out.push({ lang: 'en', text: p.trim() });
+        }
+      }
+    }
+    return out;
+  }
+
+  // Pull a JSON object out of model output even if wrapped in code fences or prose.
+  function extractJson(raw) {
+    let s = String(raw || '').trim();
+    s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+    const a = s.indexOf('{');
+    const b = s.lastIndexOf('}');
+    if (a >= 0 && b > a) s = s.slice(a, b + 1);
+    try { return JSON.parse(s); } catch (e) { return null; }
+  }
+
+  function parseHeard(raw) {
+    const obj = extractJson(raw);
+    return obj && typeof obj.heard === 'string' ? obj.heard.trim() : '';
+  }
+
+  function parseReply(raw) {
+    const obj = extractJson(raw);
+    if (obj) {
+      const chunks = normaliseChunks(obj.chunks);
+      if (chunks.length) return chunks;
+    }
+    // Fallback: treat whole thing as plain text and split by script.
+    return normaliseChunks([{ lang: 'en', text: String(raw || '').trim() }]);
+  }
+
+  async function askGemini({ apiKey, model, level, history, userText, audioB64 }) {
+    const system = SYSTEM_PROMPT.replace('{{LEVEL}}', LEVELS[level] || LEVELS.low);
+    const contents = history.map(m => ({
+      role: m.role === 'user' ? 'user' : 'model',
+      parts: [{ text: m.text }]
+    }));
+    if (audioB64) {
+      contents.push({ role: 'user', parts: [
+        { inlineData: { mimeType: 'audio/wav', data: audioB64 } },
+        { text: 'The learner spoke this audio message. Transcribe it literally into "heard", then reply.' }
+      ] });
+    } else {
+      contents.push({ role: 'user', parts: [{ text: userText }] });
+    }
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+      encodeURIComponent(model) + ':generateContent';
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents,
+        generationConfig: { responseMimeType: 'application/json', temperature: 0.8 }
+      })
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error('Gemini ' + res.status + ': ' + t.slice(0, 300));
+    }
+    const data = await res.json();
+    const text = data && data.candidates && data.candidates[0] &&
+      data.candidates[0].content && data.candidates[0].content.parts &&
+      data.candidates[0].content.parts.map(p => p.text || '').join('');
+    if (!text) throw new Error('Empty reply from model');
+    return { raw: text, heard: parseHeard(text), chunks: parseReply(text) };
+  }
+
+  // Offline demo so the dual-voice playback can be tried with no API key.
+  function mockReply(userText) {
+    const chunks = [
+      { lang: 'en', text: "Nice to meet you! Let's start simple. In Mandarin you can say" },
+      { lang: 'zh', text: '你好，很高兴认识你', pinyin: 'nǐ hǎo, hěn gāoxìng rènshi nǐ', gloss: 'Hello, nice to meet you' },
+      { lang: 'en', text: 'Now, what did you do this morning? Try telling me, in English or Mandarin.' }
+    ];
+    return { raw: JSON.stringify({ chunks }), heard: '', chunks: normaliseChunks(chunks) };
+  }
+
+  const api = { SYSTEM_PROMPT, LEVELS, normaliseChunks, parseReply, parseHeard, askGemini, mockReply };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else root.Tutor = api;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+// Dual-voice playback: each chunk is spoken with a voice that matches its language,
+// so English and Mandarin both sound natural inside one reply.
+(function (root) {
+  'use strict';
+
+  const synth = root.speechSynthesis;
+  let voices = [];
+
+  function loadVoices() {
+    voices = synth ? synth.getVoices() : [];
+  }
+  if (synth) {
+    loadVoices();
+    synth.addEventListener('voiceschanged', loadVoices);
+  }
+
+  // Pick the best voice for a language prefix ("en" or "zh"). Prefer a saved choice,
+  // then a mainland zh-CN / en-AU voice, then any voice for the language.
+  function pickVoice(lang, savedName) {
+    const prefix = lang === 'zh' ? 'zh' : 'en';
+    const pool = voices.filter(v => v.lang.toLowerCase().replace('_', '-').startsWith(prefix));
+    if (!pool.length) return null;
+    if (savedName) {
+      const saved = pool.find(v => v.name === savedName);
+      if (saved) return saved;
+    }
+    const prefs = lang === 'zh' ? ['zh-cn'] : ['en-au', 'en-gb', 'en-us'];
+    for (const p of prefs) {
+      const hit = pool.find(v => v.lang.toLowerCase().replace('_', '-') === p);
+      if (hit) return hit;
+    }
+    return pool[0];
+  }
+
+  function listVoices(lang) {
+    const prefix = lang === 'zh' ? 'zh' : 'en';
+    return voices.filter(v => v.lang.toLowerCase().replace('_', '-').startsWith(prefix));
+  }
+
+  function speakChunks(chunks, opts) {
+    opts = opts || {};
+    if (!synth) return Promise.resolve();
+    synth.cancel();
+    return new Promise(resolve => {
+      let remaining = 0;
+      const done = () => { if (--remaining <= 0) resolve(); };
+      chunks.forEach(c => {
+        const u = new SpeechSynthesisUtterance(c.text);
+        const v = pickVoice(c.lang, c.lang === 'zh' ? opts.zhVoice : opts.enVoice);
+        if (v) u.voice = v;
+        u.lang = c.lang === 'zh' ? 'zh-CN' : (v ? v.lang : 'en-AU');
+        u.rate = c.lang === 'zh' ? (opts.zhRate || 0.85) : (opts.enRate || 1);
+        u.onend = done;
+        u.onerror = done;
+        remaining++;
+        synth.speak(u);
+      });
+      if (!remaining) resolve();
+    });
+  }
+
+  function stop() { if (synth) synth.cancel(); }
+
+  root.Voice = { speakChunks, stop, listVoices, pickVoice };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+// Hands-free listening: records the microphone, detects when you start and stop
+// speaking, and hands back one WAV clip per utterance (16 kHz mono, base64).
+// The pure helpers (downsample, encodeWav, toBase64, Endpointer) are testable in Node.
+(function (root) {
+  'use strict';
+
+  function downsample(input, inRate, outRate) {
+    if (outRate >= inRate) return input;
+    const ratio = inRate / outRate;
+    const n = Math.floor(input.length / ratio);
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const start = Math.floor(i * ratio);
+      const end = Math.min(Math.floor((i + 1) * ratio), input.length);
+      let sum = 0, c = 0;
+      for (let j = start; j < end; j++) { sum += input[j]; c++; }
+      out[i] = c ? sum / c : 0;
+    }
+    return out;
+  }
+
+  function encodeWav(samples, rate) {
+    const buf = new ArrayBuffer(44 + samples.length * 2);
+    const v = new DataView(buf);
+    const wr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    wr(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true);
+    wr(8, 'WAVE'); wr(12, 'fmt '); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    wr(36, 'data'); v.setUint32(40, samples.length * 2, true);
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return buf;
+  }
+
+  function toBase64(arrayBuffer) {
+    const bytes = new Uint8Array(arrayBuffer);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return (typeof btoa === 'function') ? btoa(bin) : Buffer.from(bin, 'binary').toString('base64');
+  }
+
+  // Decides when an utterance starts and ends from a stream of loudness readings.
+  // feed(rms, ms) returns 'idle' | 'start' | 'speech' | 'end' | 'discard'.
+  class Endpointer {
+    constructor(o) {
+      o = o || {};
+      this.silenceMs = o.silenceMs || 1800;   // pause that ends your turn
+      this.minSpeechMs = o.minSpeechMs || 300; // ignore clicks and coughs
+      this.maxMs = o.maxMs || 30000;
+      this.calibMs = o.calibMs || 500;
+      this.minThr = o.minThr || 0.012;
+      this.mult = o.mult || 2.5;
+      this.t = 0; this.noise = 0; this.noiseN = 0;
+      this.resetUtterance();
+    }
+    resetUtterance() { this.speaking = false; this.speechMs = 0; this.silMs = 0; this.utterMs = 0; }
+    feed(rms, ms) {
+      this.t += ms;
+      if (this.t <= this.calibMs && !this.speaking) {
+        this.noise = (this.noise * this.noiseN + rms) / (this.noiseN + 1);
+        this.noiseN++;
+        this.noise = Math.min(this.noise, 0.03);
+        return 'idle';
+      }
+      const thr = Math.max(this.minThr, this.noise * this.mult);
+      const loud = rms > thr;
+      if (!this.speaking) {
+        if (loud) { this.speaking = true; this.speechMs = ms; this.silMs = 0; this.utterMs = ms; return 'start'; }
+        this.noise = Math.min(0.03, this.noise * 0.95 + rms * 0.05);
+        return 'idle';
+      }
+      this.utterMs += ms;
+      if (loud) { this.speechMs += ms; this.silMs = 0; } else { this.silMs += ms; }
+      if (this.silMs >= this.silenceMs || this.utterMs >= this.maxMs) {
+        const ok = this.speechMs >= this.minSpeechMs;
+        this.resetUtterance();
+        return ok ? 'end' : 'discard';
+      }
+      return 'speech';
+    }
+  }
+
+  class Listener {
+    constructor(o) {
+      o = o || {};
+      this.onUtterance = o.onUtterance || function () {};
+      this.onState = o.onState || function () {};
+      this.onLevel = o.onLevel || function () {};
+      this.ep = new Endpointer({ silenceMs: o.silenceMs });
+      this.paused = false;
+      this.pre = [];
+      this.cur = null;
+    }
+    setSilenceMs(ms) { this.ep.silenceMs = ms; }
+
+    async start() {
+      const nav = root.navigator;
+      if (!nav || !nav.mediaDevices || !nav.mediaDevices.getUserMedia) {
+        throw new Error('Microphone not available here. Open this page over https (or localhost) in Chrome.');
+      }
+      this.stream = await nav.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      const AC = root.AudioContext || root.webkitAudioContext;
+      this.ctx = new AC();
+      if (this.ctx.state === 'suspended') await this.ctx.resume();
+      this.src = this.ctx.createMediaStreamSource(this.stream);
+      this.proc = this.ctx.createScriptProcessor(4096, 1, 1);
+      this.mute = this.ctx.createGain();
+      this.mute.gain.value = 0; // keep the graph running without echoing the mic
+      this.src.connect(this.proc);
+      this.proc.connect(this.mute);
+      this.mute.connect(this.ctx.destination);
+      this.proc.onaudioprocess = e => this._onAudio(e.inputBuffer.getChannelData(0));
+      this.onState('listening');
+    }
+
+    setPaused(p) {
+      this.paused = p;
+      if (!p) { this.ep.resetUtterance(); this.pre = []; this.cur = null; this.onState('listening'); }
+    }
+
+    _onAudio(input) {
+      if (this.paused) return;
+      const copy = new Float32Array(input);
+      let sum = 0;
+      for (let i = 0; i < copy.length; i++) sum += copy[i] * copy[i];
+      const rms = Math.sqrt(sum / copy.length);
+      this.onLevel(rms);
+      const ms = copy.length / this.ctx.sampleRate * 1000;
+      const evt = this.ep.feed(rms, ms);
+      if (evt === 'idle') {
+        this.pre.push(copy);
+        if (this.pre.length > 5) this.pre.shift(); // ~0.4 s of lead-in so the first syllable isn't clipped
+      } else if (evt === 'start') {
+        this.cur = this.pre.concat([copy]);
+        this.pre = [];
+        this.onState('hearing');
+      } else if (evt === 'speech') {
+        if (this.cur) this.cur.push(copy);
+      } else if (evt === 'end' || evt === 'discard') {
+        if (this.cur) this.cur.push(copy);
+        const chunks = this.cur || [];
+        this.cur = null;
+        this.pre = [];
+        if (evt === 'end' && chunks.length) {
+          let total = 0;
+          chunks.forEach(c => { total += c.length; });
+          const all = new Float32Array(total);
+          let o = 0;
+          chunks.forEach(c => { all.set(c, o); o += c.length; });
+          const wav = encodeWav(downsample(all, this.ctx.sampleRate, 16000), 16000);
+          this.onUtterance(toBase64(wav));
+        } else {
+          this.onState('listening');
+        }
+      }
+    }
+
+    stop() {
+      try { if (this.proc) this.proc.onaudioprocess = null; } catch (e) { /* ignore */ }
+      try { if (this.stream) this.stream.getTracks().forEach(t => t.stop()); } catch (e) { /* ignore */ }
+      try { if (this.ctx) this.ctx.close(); } catch (e) { /* ignore */ }
+      this.onState('idle');
+    }
+  }
+
+  const api = { downsample, encodeWav, toBase64, Endpointer, Listener };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else root.Listen = api;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+// UI wiring: typed or spoken input -> tutor -> tagged chunks -> dual-voice playback.
+(function () {
+  'use strict';
+
+  const $ = id => document.getElementById(id);
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ }
+    }
+  };
+
+  const chat = $('chat');
+  const input = $('input');
+  const status = $('status');
+  const micBtn = $('mic');
+  const meter = $('meterFill');
+  let history = []; // {role:'user'|'tutor', text}
+  let busy = false;
+  let listener = null;
+  let wakeLock = null;
+
+  // ---- settings ----
+  $('apiKey').value = store.get('apiKey', '');
+  $('model').value = store.get('model', 'gemini-2.5-flash');
+  $('level').value = store.get('level', 'low');
+  $('pause').value = store.get('pause', '1800');
+  ['apiKey', 'model', 'level', 'pause'].forEach(id => {
+    $(id).addEventListener('change', () => {
+      store.set(id, $(id).value.trim());
+      if (id === 'pause' && listener) listener.setSilenceMs(parseInt($('pause').value, 10));
+    });
+  });
+
+  function fillVoices() {
+    ['en', 'zh'].forEach(lang => {
+      const sel = $(lang + 'Voice');
+      const saved = store.get(lang + 'Voice', '');
+      sel.innerHTML = '<option value="">Auto</option>';
+      Voice.listVoices(lang).forEach(v => {
+        const o = document.createElement('option');
+        o.value = v.name;
+        o.textContent = v.name + ' (' + v.lang + ')';
+        if (v.name === saved) o.selected = true;
+        sel.appendChild(o);
+      });
+      sel.onchange = () => store.set(lang + 'Voice', sel.value);
+    });
+  }
+  if (window.speechSynthesis) {
+    fillVoices();
+    window.speechSynthesis.addEventListener('voiceschanged', fillVoices);
+  }
+
+  // ---- rendering ----
+  function addUser(text, spoken) {
+    const d = document.createElement('div');
+    d.className = 'msg user';
+    d.textContent = (spoken ? '🎤 ' : '') + text;
+    chat.appendChild(d);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function addTutor(chunks) {
+    const d = document.createElement('div');
+    d.className = 'msg tutor';
+    chunks.forEach(c => {
+      if (c.lang === 'zh') {
+        const z = document.createElement('div');
+        z.className = 'zh';
+        const hz = document.createElement('div');
+        hz.className = 'hanzi';
+        hz.textContent = c.text;
+        z.appendChild(hz);
+        if (c.pinyin) {
+          const p = document.createElement('div');
+          p.className = 'pinyin';
+          p.textContent = c.pinyin;
+          z.appendChild(p);
+        }
+        if (c.gloss) {
+          const g = document.createElement('div');
+          g.className = 'gloss';
+          g.textContent = c.gloss;
+          z.appendChild(g);
+        }
+        d.appendChild(z);
+      } else {
+        const e = document.createElement('div');
+        e.className = 'en';
+        e.textContent = c.text;
+        d.appendChild(e);
+      }
+    });
+    const replay = document.createElement('button');
+    replay.type = 'button';
+    replay.className = 'replay';
+    replay.textContent = '▶ Replay';
+    replay.onclick = () => speak(chunks);
+    d.appendChild(replay);
+    chat.appendChild(d);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  // Speak and resolve when finished. Android sometimes never fires "end", so cap the wait.
+  function speak(chunks) {
+    const rate = parseFloat(store.get('zhRate', '0.85'));
+    let cap = 4000;
+    chunks.forEach(c => { cap += c.lang === 'zh' ? c.text.length * 500 / rate : c.text.length * 90; });
+    const talk = Voice.speakChunks(chunks, {
+      enVoice: store.get('enVoice', ''),
+      zhVoice: store.get('zhVoice', ''),
+      zhRate: rate
+    });
+    return Promise.race([talk, new Promise(r => setTimeout(r, cap))]);
+  }
+
+  function setStatus(t) { status.textContent = t; }
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+
+  // ---- one conversational turn (typed or spoken) ----
+  async function turn({ text, audioB64 }) {
+    if (busy) return;
+    busy = true;
+    if (listener) listener.setPaused(true);
+    setStatus('Thinking…');
+    try {
+      const apiKey = $('apiKey').value.trim() || store.get('apiKey', '');
+      let result;
+      if (!apiKey) {
+        if (audioB64) throw new Error('Spoken turns need a Gemini API key. Add one in Settings.');
+        result = Tutor.mockReply(text);
+      } else {
+        result = await Tutor.askGemini({
+          apiKey,
+          model: $('model').value.trim() || store.get('model', 'gemini-2.5-flash'),
+          level: $('level').value || store.get('level', 'low'),
+          history: history.slice(-20),
+          userText: text,
+          audioB64
+        });
+      }
+      const userText = audioB64 ? (result.heard || '(could not make that out)') : text;
+      addUser(userText, !!audioB64);
+      if (audioB64 && !result.heard) { /* tutor was told to ask for a repeat */ }
+      history.push({ role: 'user', text: userText });
+      history.push({ role: 'tutor', text: JSON.stringify({ chunks: result.chunks }) });
+      addTutor(result.chunks);
+      setStatus('Speaking…');
+      await speak(result.chunks);
+    } catch (err) {
+      setStatus('Error: ' + err.message);
+      await delay(1500);
+    } finally {
+      busy = false;
+      if (listener) {
+        await delay(400); // let the speaker tail off so we don't hear ourselves
+        listener.setPaused(false);
+        setStatus('Listening… speak whenever you are ready.');
+      } else {
+        setStatus('');
+      }
+    }
+  }
+
+  // ---- typed input ----
+  function sendTyped() {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    turn({ text });
+  }
+  $('form').addEventListener('submit', e => { e.preventDefault(); });
+  $('send').addEventListener('click', sendTyped);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendTyped(); } });
+
+  // ---- hands-free conversation ----
+  async function keepAwake() {
+    try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { /* optional */ }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (listener && document.visibilityState === 'visible') keepAwake();
+  });
+
+  async function startConversation() {
+    if (!($('apiKey').value.trim() || store.get('apiKey', ''))) {
+      setStatus('Add your Gemini API key in Settings first. Spoken turns need it.');
+      return;
+    }
+    try {
+      listener = new Listen.Listener({
+        silenceMs: parseInt($('pause').value, 10) || 1800,
+        onUtterance: b64 => turn({ audioB64: b64 }),
+        onState: s => {
+          if (busy) return;
+          if (s === 'hearing') setStatus('Hearing you…');
+          else if (s === 'listening') setStatus('Listening… speak whenever you are ready.');
+        },
+        onLevel: rms => { meter.style.width = Math.min(100, Math.round(rms * 600)) + '%'; }
+      });
+      await listener.start();
+      micBtn.classList.add('on');
+      micBtn.textContent = '⏹ End';
+      $('meter').hidden = false;
+      keepAwake();
+    } catch (err) {
+      listener = null;
+      setStatus(micErrorText(err));
+    }
+  }
+
+  // Turn the browser's terse microphone errors into something actionable.
+  function micErrorText(err) {
+    const name = err && err.name;
+    const where = location.protocol === 'file:' ? ' This page was opened as a local file; host it over https instead.' : '';
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      return 'Microphone blocked.' + where +
+        ' In Chrome, tap the icon left of the address bar, then Permissions, then allow Microphone, and reload.' +
+        ' Also check Android Settings > Apps > Chrome > Permissions > Microphone.' +
+        ' If you opened this inside another app, open it in Chrome instead.';
+    }
+    if (name === 'NotFoundError') return 'No microphone found on this device.';
+    if (name === 'NotReadableError') return 'The microphone is busy. Close other apps using it and try again.';
+    return 'Error: ' + (err && err.message ? err.message : err);
+  }
+
+  function endConversation() {
+    if (listener) listener.stop();
+    listener = null;
+    micBtn.classList.remove('on');
+    micBtn.textContent = '🎤 Talk';
+    $('meter').hidden = true;
+    meter.style.width = '0%';
+    try { if (wakeLock) wakeLock.release(); } catch (e) { /* ignore */ }
+    wakeLock = null;
+    setStatus('');
+  }
+
+  micBtn.addEventListener('click', () => { if (listener) endConversation(); else startConversation(); });
+  $('stop').addEventListener('click', () => Voice.stop()); // also acts as "interrupt"
+  $('clear').addEventListener('click', () => { history = []; chat.innerHTML = ''; setStatus(''); });
+
+  setStatus('Ready.');
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => { /* optional */ });
+  }
+})();
+
+</script>
+
+</body>
+</html>
