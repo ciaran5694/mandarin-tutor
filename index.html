@@ -72,6 +72,11 @@
     <option value="1800">Normal (1.8 s)</option>
     <option value="2600">Long (2.6 s), for thinking time</option>
   </select>
+  <label for="gloss">Say the English meaning after each Mandarin phrase</label>
+  <select id="gloss">
+    <option value="on">Yes</option>
+    <option value="off">No, show it on screen only</option>
+  </select>
   <label for="enVoice">English voice</label>
   <select id="enVoice"><option value="">Auto</option></select>
   <label for="zhVoice">Mandarin voice</label>
@@ -110,7 +115,8 @@ STYLE
 - Keep each reply short (2-4 sentences) so it works spoken aloud. Ask a follow-up question to keep the chat going.
 - Use simplified characters and mainland standard Mandarin.
 - If the learner makes a mistake, repeat their sentence naturally corrected and briefly say why. Do NOT comment on their pronunciation or tones from the transcript, because speech-to-text cannot hear tones.
-- When you introduce a new Mandarin word, use it in a short phrase and give the English meaning.
+- When you introduce a new Mandarin word, use it in a short phrase.
+- The app automatically reads each Mandarin chunk's English "gloss" aloud right after it. So make the gloss a short, natural English translation that sounds fine spoken, and do NOT repeat the meaning in a separate English chunk.
 
 WHEN THE LEARNER'S MESSAGE IS AUDIO
 - First transcribe exactly what they said into "heard", keeping their mistakes and keeping both languages as spoken (Mandarin in simplified hanzi, English in English). Never tidy or correct the transcript.
@@ -236,27 +242,32 @@ Return ONLY JSON: {"heard":"(audio turns only: literal transcript)","chunks":[{"
 
 </script>
 <script>
-// Dual-voice playback: each chunk is spoken with a voice that matches its language,
-// so English and Mandarin both sound natural inside one reply.
+// Dual-voice playback. Each chunk is spoken with a voice matching its language, one after
+// another with short gaps. After a Mandarin chunk the app can also read its English meaning
+// aloud, so you hear the translation without looking at the screen.
 (function (root) {
   'use strict';
 
   const synth = root.speechSynthesis;
   let voices = [];
+  let token = 0; // bump to cancel whatever is currently playing
 
-  function loadVoices() {
-    voices = synth ? synth.getVoices() : [];
-  }
+  function loadVoices() { voices = synth ? synth.getVoices() : []; }
   if (synth) {
     loadVoices();
-    synth.addEventListener('voiceschanged', loadVoices);
+    if (synth.addEventListener) synth.addEventListener('voiceschanged', loadVoices);
   }
 
-  // Pick the best voice for a language prefix ("en" or "zh"). Prefer a saved choice,
-  // then a mainland zh-CN / en-AU voice, then any voice for the language.
-  function pickVoice(lang, savedName) {
+  const norm = v => v.lang.toLowerCase().replace('_', '-');
+
+  function listVoices(lang) {
     const prefix = lang === 'zh' ? 'zh' : 'en';
-    const pool = voices.filter(v => v.lang.toLowerCase().replace('_', '-').startsWith(prefix));
+    return voices.filter(v => norm(v).startsWith(prefix));
+  }
+
+  // Prefer a saved choice, then mainland zh-CN / Australian-British-US English, then any.
+  function pickVoice(lang, savedName) {
+    const pool = listVoices(lang);
     if (!pool.length) return null;
     if (savedName) {
       const saved = pool.find(v => v.name === savedName);
@@ -264,42 +275,69 @@ Return ONLY JSON: {"heard":"(audio turns only: literal transcript)","chunks":[{"
     }
     const prefs = lang === 'zh' ? ['zh-cn'] : ['en-au', 'en-gb', 'en-us'];
     for (const p of prefs) {
-      const hit = pool.find(v => v.lang.toLowerCase().replace('_', '-') === p);
+      const hit = pool.find(v => norm(v) === p);
       if (hit) return hit;
     }
     return pool[0];
   }
 
-  function listVoices(lang) {
-    const prefix = lang === 'zh' ? 'zh' : 'en';
-    return voices.filter(v => v.lang.toLowerCase().replace('_', '-').startsWith(prefix));
+  // Expand chunks into the exact things to say, in order.
+  function buildPlan(chunks, opts) {
+    const plan = [];
+    (chunks || []).forEach(c => {
+      plan.push({ lang: c.lang, text: c.text, kind: 'main' });
+      if (c.lang === 'zh' && opts.speakGloss && c.gloss && c.gloss.trim()) {
+        plan.push({ lang: 'en', text: c.gloss.trim(), kind: 'gloss' });
+      }
+    });
+    return plan;
   }
 
-  function speakChunks(chunks, opts) {
-    opts = opts || {};
-    if (!synth) return Promise.resolve();
-    synth.cancel();
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  function speakOne(item, opts, myToken) {
     return new Promise(resolve => {
-      let remaining = 0;
-      const done = () => { if (--remaining <= 0) resolve(); };
-      chunks.forEach(c => {
-        const u = new SpeechSynthesisUtterance(c.text);
-        const v = pickVoice(c.lang, c.lang === 'zh' ? opts.zhVoice : opts.enVoice);
-        if (v) u.voice = v;
-        u.lang = c.lang === 'zh' ? 'zh-CN' : (v ? v.lang : 'en-AU');
-        u.rate = c.lang === 'zh' ? (opts.zhRate || 0.85) : (opts.enRate || 1);
-        u.onend = done;
-        u.onerror = done;
-        remaining++;
-        synth.speak(u);
-      });
-      if (!remaining) resolve();
+      const rate = item.lang === 'zh' ? (opts.zhRate || 0.85) : (opts.enRate || 1);
+      // Android sometimes never fires "end", so every utterance has a safety timeout.
+      const cap = 3000 + (item.lang === 'zh' ? item.text.length * 500 / rate : item.text.length * 90);
+      let finished = false;
+      const done = () => { if (!finished) { finished = true; clearTimeout(timer); resolve(); } };
+      const timer = setTimeout(done, cap);
+      const u = new root.SpeechSynthesisUtterance(item.text);
+      const v = pickVoice(item.lang, item.lang === 'zh' ? opts.zhVoice : opts.enVoice);
+      if (v) u.voice = v;
+      u.lang = item.lang === 'zh' ? 'zh-CN' : (v ? v.lang : 'en-AU');
+      u.rate = rate;
+      u.onend = done;
+      u.onerror = done;
+      if (myToken !== token) { done(); return; }
+      synth.speak(u);
     });
   }
 
-  function stop() { if (synth) synth.cancel(); }
+  async function speakChunks(chunks, opts) {
+    opts = opts || {};
+    if (!synth) return;
+    synth.cancel();
+    const myToken = ++token;
+    const plan = buildPlan(chunks, opts);
+    for (let i = 0; i < plan.length; i++) {
+      if (myToken !== token) return;
+      await speakOne(plan[i], opts, myToken);
+      if (myToken !== token) return;
+      if (i < plan.length - 1) {
+        // a slightly longer beat before the English meaning, so it reads as a translation
+        await sleep(plan[i + 1].kind === 'gloss' ? (opts.glossGapMs || 350) : (opts.gapMs || 200));
+      }
+    }
+  }
 
-  root.Voice = { speakChunks, stop, listVoices, pickVoice };
+  function stop() {
+    token++;
+    if (synth) synth.cancel();
+  }
+
+  root.Voice = { speakChunks, stop, listVoices, pickVoice, buildPlan };
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
@@ -510,7 +548,8 @@ Return ONLY JSON: {"heard":"(audio turns only: literal transcript)","chunks":[{"
   $('model').value = store.get('model', 'gemini-2.5-flash');
   $('level').value = store.get('level', 'low');
   $('pause').value = store.get('pause', '1800');
-  ['apiKey', 'model', 'level', 'pause'].forEach(id => {
+  $('gloss').value = store.get('gloss', 'on');
+  ['apiKey', 'model', 'level', 'pause', 'gloss'].forEach(id => {
     $(id).addEventListener('change', () => {
       store.set(id, $(id).value.trim());
       if (id === 'pause' && listener) listener.setSilenceMs(parseInt($('pause').value, 10));
@@ -587,17 +626,14 @@ Return ONLY JSON: {"heard":"(audio turns only: literal transcript)","chunks":[{"
     chat.scrollTop = chat.scrollHeight;
   }
 
-  // Speak and resolve when finished. Android sometimes never fires "end", so cap the wait.
+  // Speak and resolve when finished (voice.js guards against Android never firing "end").
   function speak(chunks) {
-    const rate = parseFloat(store.get('zhRate', '0.85'));
-    let cap = 4000;
-    chunks.forEach(c => { cap += c.lang === 'zh' ? c.text.length * 500 / rate : c.text.length * 90; });
-    const talk = Voice.speakChunks(chunks, {
+    return Voice.speakChunks(chunks, {
       enVoice: store.get('enVoice', ''),
       zhVoice: store.get('zhVoice', ''),
-      zhRate: rate
+      zhRate: parseFloat(store.get('zhRate', '0.85')),
+      speakGloss: ($('gloss').value || store.get('gloss', 'on')) === 'on'
     });
-    return Promise.race([talk, new Promise(r => setTimeout(r, cap))]);
   }
 
   function setStatus(t) { status.textContent = t; }
